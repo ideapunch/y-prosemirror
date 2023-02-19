@@ -75,6 +75,73 @@ const getUserColor = (colorMapping, colors, user) => {
   return /** @type {ColorDef} */ (colorMapping.get(user))
 }
 
+class YSyncPluginState {
+  constructor (yXmlFragment, { colors, colorMapping, permanentUserData }) {
+    this.type = yXmlFragment
+    this.doc = yXmlFragment.doc
+    this.binding = null
+    this.snapshot = null
+    this.prevSnapshot = null
+    this.isChangeOrigin = false
+    this.isUndoRedoOperation = false
+    this.addToHistory = true
+    this.colors = colors
+    this.colorMapping = colorMapping
+    this.permanentUserData = permanentUserData
+  }
+
+  init (view) {
+    if (this.binding) {
+      return this
+    }
+    this.binding = new ProsemirrorBinding(this.type, view)
+    return this
+  }
+
+  destroy () {
+    if (this.binding) {
+      this.binding.destroy()
+    }
+    this.binding = null
+  }
+
+  apply (tr) {
+    const change = tr.getMeta(ySyncPluginKey)
+    if (change !== undefined) {
+        for (const key in change) {
+          this[key] = change[key]
+        }
+    }
+    this.addToHistory = tr.getMeta("addToHistory") !== false
+    // always set isChangeOrigin. If undefined, this is not change origin.
+    this.isChangeOrigin = change !== undefined && !!change.isChangeOrigin
+    this.isUndoRedoOperation = change !== undefined && !!change.isChangeOrigin && !!change.isUndoRedoOperation
+    if (this.binding !== null) {
+        if (change !== undefined && (change.snapshot != null || change.prevSnapshot != null)) {
+            // snapshot changed, rerender next
+            eventloop.timeout(0, () => {
+                if (this.binding == null || this.binding.isDestroyed) {
+                    return
+                }
+                if (change.restore == null) {
+                  this.binding._renderSnapshot(change.snapshot, change.prevSnapshot, this)
+                } else {
+                  this.binding._renderSnapshot(change.snapshot, change.snapshot, this)
+                    // reset to current prosemirror state
+                    this.restore = undefined
+                    this.snapshot = undefined
+                    this.prevSnapshot = undefined
+                    this.binding.mux(() => {
+                      this.binding._prosemirrorChanged(this.binding.prosemirrorView.state.doc)
+                    })
+                }
+            })
+        }
+    }
+    return this
+  }
+}
+
 /**
  * This plugin listens to changes in prosemirror view and keeps yXmlState and view in sync.
  *
@@ -91,140 +158,68 @@ export const ySyncPlugin = (yXmlFragment, {
 } = {}) => {
   let changedInitialContent = false
   let rerenderTimeout
-  const plugin = new Plugin({
-    props: {
-      editable: (state) => {
-        const syncState = ySyncPluginKey.getState(state)
-        return syncState.snapshot == null && syncState.prevSnapshot == null
-      }
-    },
-    key: ySyncPluginKey,
-    state: {
-      /**
-       * @returns {any}
-       */
-      init: (_initargs, _state) => {
-        return {
-          type: yXmlFragment,
-          doc: yXmlFragment.doc,
-          binding: null,
-          snapshot: null,
-          prevSnapshot: null,
-          isChangeOrigin: false,
-          isUndoRedoOperation: false,
-          addToHistory: true,
-          colors,
-          colorMapping,
-          permanentUserData
-        }
+  const pluginState = new YSyncPluginState(yXmlFragment, { colors, colorMapping, permanentUserData })
+  return new Plugin({
+      props: {
+          editable: (state) => {
+              const syncState = ySyncPluginKey.getState(state)
+              return syncState.snapshot == null && syncState.prevSnapshot == null
+          },
       },
-      apply: (tr, pluginState) => {
-        const change = tr.getMeta(ySyncPluginKey)
-        if (change !== undefined) {
-          pluginState = Object.assign({}, pluginState)
-          for (const key in change) {
-            pluginState[key] = change[key]
+      key: ySyncPluginKey,
+      state: {
+          /**
+           * @returns {any}
+           */
+          init: (_initargs, _state) => {
+            return pluginState
+          },
+          apply: (tr, pluginState) => {
+            return pluginState.apply(tr)
+          },
+      },
+      view: (view) => {
+        const { binding } = pluginState.init(view)
+          if (rerenderTimeout != null) {
+              rerenderTimeout.destroy()
           }
-        }
-        pluginState.addToHistory = tr.getMeta('addToHistory') !== false
-        // always set isChangeOrigin. If undefined, this is not change origin.
-        pluginState.isChangeOrigin = change !== undefined &&
-          !!change.isChangeOrigin
-        pluginState.isUndoRedoOperation = change !== undefined && !!change.isChangeOrigin && !!change.isUndoRedoOperation
-        if (pluginState.binding !== null) {
-          if (
-            change !== undefined &&
-            (change.snapshot != null || change.prevSnapshot != null)
-          ) {
-            // snapshot changed, rerender next
-            eventloop.timeout(0, () => {
-              if (
-                pluginState.binding == null || pluginState.binding.isDestroyed
-              ) {
-                return
-              }
-              if (change.restore == null) {
-                pluginState.binding._renderSnapshot(
-                  change.snapshot,
-                  change.prevSnapshot,
-                  pluginState
-                )
-              } else {
-                pluginState.binding._renderSnapshot(
-                  change.snapshot,
-                  change.snapshot,
-                  pluginState
-                )
-                // reset to current prosemirror state
-                delete pluginState.restore
-                delete pluginState.snapshot
-                delete pluginState.prevSnapshot
-                pluginState.binding.mux(() => {
-                  pluginState.binding._prosemirrorChanged(
-                    pluginState.binding.prosemirrorView.state.doc
-                  )
-                })
-              }
-            })
+          // Make sure this is called in a separate context
+          rerenderTimeout = eventloop.timeout(0, () => {
+              binding._forceRerender()
+              view.dispatch(view.state.tr.setMeta(ySyncPluginKey, { forceUpdate: true }))
+              onFirstRender()
+          })
+          return {
+              update: () => {
+                  if (pluginState.snapshot == null && pluginState.prevSnapshot == null) {
+                      if (changedInitialContent || view.state.doc.content.findDiffStart(view.state.doc.type.createAndFill().content) !== null) {
+                          changedInitialContent = true
+                          if (pluginState.addToHistory === false && !pluginState.isChangeOrigin) {
+                              const yUndoPluginState = yUndoPluginKey.getState(view.state)
+                              /**
+                               * @type {Y.UndoManager}
+                               */
+                              const um = yUndoPluginState && yUndoPluginState.undoManager
+                              if (um) {
+                                  um.stopCapturing()
+                              }
+                          }
+                          binding.mux(() => {
+                              /** @type {Y.Doc} */ ;(pluginState.doc).transact((tr) => {
+                                  tr.meta.set("addToHistory", pluginState.addToHistory)
+                                  binding._prosemirrorChanged(view.state.doc)
+                              }, ySyncPluginKey)
+                          })
+                      }
+                  }
+              },
+              destroy: () => {
+                  rerenderTimeout.destroy()
+                  pluginState.destroy()
+              },
           }
-        }
-        return pluginState
-      }
-    },
-    view: (view) => {
-      const binding = new ProsemirrorBinding(yXmlFragment, view)
-      if (rerenderTimeout != null) {
-        rerenderTimeout.destroy()
-      }
-      // Make sure this is called in a separate context
-      rerenderTimeout = eventloop.timeout(0, () => {
-        binding._forceRerender()
-        view.dispatch(view.state.tr.setMeta(ySyncPluginKey, { binding }))
-        onFirstRender()
-      })
-      return {
-        update: () => {
-          const pluginState = plugin.getState(view.state)
-          if (
-            pluginState.snapshot == null && pluginState.prevSnapshot == null
-          ) {
-            if (
-              changedInitialContent ||
-              view.state.doc.content.findDiffStart(
-                view.state.doc.type.createAndFill().content
-              ) !== null
-            ) {
-              changedInitialContent = true
-              if (
-                pluginState.addToHistory === false &&
-                !pluginState.isChangeOrigin
-              ) {
-                const yUndoPluginState = yUndoPluginKey.getState(view.state)
-                /**
-                 * @type {Y.UndoManager}
-                 */
-                const um = yUndoPluginState && yUndoPluginState.undoManager
-                if (um) {
-                  um.stopCapturing()
-                }
-              }
-              binding.mux(() => {
-                /** @type {Y.Doc} */ (pluginState.doc).transact((tr) => {
-                  tr.meta.set('addToHistory', pluginState.addToHistory)
-                  binding._prosemirrorChanged(view.state.doc)
-                }, ySyncPluginKey)
-              })
-            }
-          }
-        },
-        destroy: () => {
-          rerenderTimeout.destroy()
-          binding.destroy()
-        }
-      }
-    }
+      },
   })
-  return plugin
 }
 
 /**
